@@ -58,6 +58,7 @@ static void MX_USART6_UART_Init(void);
 void Servo_Write_Command(uint8_t id, uint8_t cmd, const uint8_t *params, uint8_t param_len);
 void Servo_Set_Multi_Turn_Position(uint8_t id, float target_angle_deg, uint32_t time_ms, uint16_t power_mw);
 Servo_Feedback_t Servo_Read_Multi_Turn_Position(uint8_t id);
+void Servo_Sync_Set_Multi_Turn_Position_3CH(float angle0, float angle1, float angle2, uint32_t time_ms, uint16_t power_mw);
 /* USER CODE END PFP */
 
 /* Private user code ---------------------------------------------------------*/
@@ -98,20 +99,29 @@ int main(void)
   /* USER CODE BEGIN 2 */
   HAL_GPIO_WritePin(GPIOE, GPIO_PIN_7, GPIO_PIN_SET); // 关闭发送通道
   HAL_GPIO_WritePin(GPIOE, GPIO_PIN_8, GPIO_PIN_SET); // 关闭接收通道
-  Servo_Set_Multi_Turn_Position(0, -360.0f, 3000, 0);
+  Servo_Set_Multi_Turn_Position(0, 540.0f, 3000, 0);
   HAL_Delay(3500); // 等待旋转完成
-
+  Servo_Sync_Set_Multi_Turn_Position_3CH(360.0f, 240.0f, 0.0f, 3000, 0);
+  HAL_Delay(3500);
   /* USER CODE END 2 */
 
   /* Infinite loop */
   /* USER CODE BEGIN WHILE */
-  Servo_Feedback_t servo1_data;
+  Servo_Feedback_t servos_data[3];
   while (1)
   {
     /* USER CODE END WHILE */
-    servo1_data = Servo_Read_Multi_Turn_Position(0);
+    // 依次轮询读取 ID 0, 1, 2
+    for (uint8_t id = 0; id < 3; id++)
+    {
+      servos_data[id] = Servo_Read_Multi_Turn_Position(id);
 
-    HAL_Delay(200);
+      // 读完一个舵机后，稍微延时 5ms 腾出总线空闲，避免发包太密产生冲突
+      HAL_Delay(5);
+    }
+
+    // 整个大循环周期延时（可根据业务需求调整）
+    HAL_Delay(100);
     /* USER CODE BEGIN 3 */
   }
   /* USER CODE END 3 */
@@ -368,6 +378,78 @@ Servo_Feedback_t Servo_Read_Multi_Turn_Position(uint8_t id)
   }
 
   return result; // 失败返回全0
+}
+
+/**
+  * @brief  同步控制三个舵机（ID:0, 1, 2）的多圈旋转角度（基于时间）
+  * @param  angle0/1/2: 目标角度（支持正负、多圈，例如 720.0 度，传参 720.0）
+  * @param  time_ms: 运动时间（三个舵机统一运动时间）
+  * @param  power_mw: 执行功率（传 0 时按照最大执行功率运行）
+  */
+void Servo_Sync_Set_Multi_Turn_Position_3CH(float angle0, float angle1, float angle2, uint32_t time_ms, uint16_t power_mw)
+{
+  uint8_t buf[64]; // 36字节数据，开辟64字节缓冲区
+  float angles[3] = {angle0, angle1, angle2};
+
+  // 1. 外层固定协议头
+  buf[0] = 0x12;     // 固定标识
+  buf[1] = 0x4c;     // 固定标识
+  buf[2] = 0x19;     // 同步写指令 0x19
+
+  // 【精准计算】：内层11字节 * 3个舵机 + 3 = 36 字节
+  buf[3] = 36;
+
+  // 2. 内层配置（严格对齐 0x0D 简易多圈指令）
+  buf[4] = 0x0D;     // 内层核心指令：简易多圈角度控制 (0x0D)
+  buf[5] = 11;       // 内层单机长度：严格填 11
+  buf[6] = 0x03;     // 舵机个数：3个
+
+  // 3. 循环装载 3 个舵机的数据，从 buf[7] 开始
+  uint8_t base_idx = 7;
+
+  for (uint8_t id = 0; id < 3; id++)
+  {
+    buf[base_idx++] = id; // 写入舵机 ID（0, 1, 2）
+
+    // position: 目标位置（4 字节 int32_t，单位0.1°，小端模式）
+    int32_t pos_val = (int32_t)(angles[id] * 10.0f);
+    buf[base_idx++] = (uint8_t)(pos_val & 0xFF);
+    buf[base_idx++] = (uint8_t)((pos_val >> 8) & 0xFF);
+    buf[base_idx++] = (uint8_t)((pos_val >> 16) & 0xFF);
+    buf[base_idx++] = (uint8_t)((pos_val >> 24) & 0xFF);
+
+    // time: 运动时间（4 字节 uint32_t，单位ms，小端模式）
+    buf[base_idx++] = (uint8_t)(time_ms & 0xFF);
+    buf[base_idx++] = (uint8_t)((time_ms >> 8) & 0xFF);
+    buf[base_idx++] = (uint8_t)((time_ms >> 16) & 0xFF);
+    buf[base_idx++] = (uint8_t)((time_ms >> 24) & 0xFF);
+
+    // power: 执行功率（2 字节 uint16_t，小端模式）
+    buf[base_idx++] = (uint8_t)(power_mw & 0xFF);
+    buf[base_idx++] = (uint8_t)((power_mw >> 8) & 0xFF);
+  }
+
+  // 4. 计算整体校验和
+  uint32_t sum = 0;
+  for (uint8_t i = 0; i < base_idx; i++) {
+    sum += buf[i];
+  }
+  buf[base_idx] = (uint8_t)(sum % 256); // 写入最后一字节校验码
+
+  // 5. 硬件切换为发送状态
+  HAL_GPIO_WritePin(GPIOE, GPIO_PIN_8, GPIO_PIN_SET);
+  HAL_GPIO_WritePin(GPIOE, GPIO_PIN_7, GPIO_PIN_RESET);
+
+  // 6. 串口发送（总长 base_idx + 1 字节）
+  HAL_UART_Transmit(&huart6, buf, base_idx + 1, 200);
+
+  // 等待硬件发送完毕
+  while(__HAL_UART_GET_FLAG(&huart6, UART_FLAG_TC) == RESET);
+  for(volatile uint32_t i = 0; i < 200; i++);
+
+  // 恢复默认接收状态
+  HAL_GPIO_WritePin(GPIOE, GPIO_PIN_7, GPIO_PIN_SET);
+  HAL_GPIO_WritePin(GPIOE, GPIO_PIN_8, GPIO_PIN_RESET); // 👈 加上这一行：开接收
 }
 /* USER CODE END 4 */
 
