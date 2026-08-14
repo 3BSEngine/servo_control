@@ -21,7 +21,7 @@
 
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
-
+#include "3bsd_kinematics.h"
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -35,7 +35,8 @@ typedef struct {
 
 /* Private define ------------------------------------------------------------*/
 /* USER CODE BEGIN PD */
-
+/* 齿轮减速传动比 (1 : 8.25)，写在私有宏定义区 */
+#define GEAR_REDUCTION_RATIO   8.25
 /* USER CODE END PD */
 
 /* Private macro -------------------------------------------------------------*/
@@ -47,7 +48,14 @@ typedef struct {
 UART_HandleTypeDef huart6;
 
 /* USER CODE BEGIN PV */
-
+/* 定义变量存储解算出的三个舵机/轴承目标角度 */
+double target_w1 = 0.0;
+double target_w2 = 0.0;
+double target_w3 = 0.0;
+/* 定义变量存储经传动比换算后，实际发给舵机的控制角度 */
+float servo_cmd_angle0 = 0.0f;
+float servo_cmd_angle1 = 0.0f;
+float servo_cmd_angle2 = 0.0f;
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -99,9 +107,24 @@ int main(void)
   /* USER CODE BEGIN 2 */
   HAL_GPIO_WritePin(GPIOE, GPIO_PIN_7, GPIO_PIN_SET); // 关闭发送通道
   HAL_GPIO_WritePin(GPIOE, GPIO_PIN_8, GPIO_PIN_SET); // 关闭接收通道
-  Servo_Set_Multi_Turn_Position(0, 540.0f, 3000, 0);
-  HAL_Delay(3500); // 等待旋转完成
-  Servo_Sync_Set_Multi_Turn_Position_3CH(360.0f, 240.0f, 0.0f, 3000, 0);
+  // 测试参数：截面倾角 24度，期望下偏 60度，侧偏 10度
+  double input_dN = 0.0;
+  double input_dNy = 0.0;
+  double param_theta = 26.25;
+  //Servo_Set_Multi_Turn_Position(2, 0.0f, 3000, 0);
+  //HAL_Delay(3500); // 等待旋转完成
+  // 2. 调用逆运动学解算算法
+  if (solveInverseKinematics(input_dN, input_dNy, param_theta, &target_w1, &target_w2, &target_w3))
+  {
+    // 3. 核心计算：考虑 1:8.25 传动比，换算为舵机实际目标角度
+    // 假设：舵机ID 0 控制第1级轴承 (w1), ID 1 控制第2级 (w2), ID 2 控制第3级 (w3)
+    servo_cmd_angle0 = (float)(target_w1 * GEAR_REDUCTION_RATIO);
+    servo_cmd_angle1 = (float)(target_w2 * GEAR_REDUCTION_RATIO);
+    servo_cmd_angle2 = (float)(target_w3 * GEAR_REDUCTION_RATIO);
+
+    // 4. 三通道同步下发控制指令给总线舵机（3000ms内运动到位）
+    Servo_Sync_Set_Multi_Turn_Position_3CH(servo_cmd_angle0, servo_cmd_angle2, servo_cmd_angle1, 3000, 0);
+  }
   HAL_Delay(3500);
   /* USER CODE END 2 */
 
