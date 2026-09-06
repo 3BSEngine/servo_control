@@ -22,6 +22,7 @@
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
 #include "3bsd_kinematics.h"
+#include <math.h>
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -45,6 +46,8 @@ typedef struct {
 /* USER CODE END PM */
 
 /* Private variables ---------------------------------------------------------*/
+TIM_HandleTypeDef htim3;
+
 UART_HandleTypeDef huart6;
 
 /* USER CODE BEGIN PV */
@@ -62,11 +65,13 @@ float servo_cmd_angle2 = 0.0f;
 void SystemClock_Config(void);
 static void MX_GPIO_Init(void);
 static void MX_USART6_UART_Init(void);
+static void MX_TIM3_Init(void);
 /* USER CODE BEGIN PFP */
 void Servo_Write_Command(uint8_t id, uint8_t cmd, const uint8_t *params, uint8_t param_len);
 void Servo_Set_Multi_Turn_Position(uint8_t id, float target_angle_deg, uint32_t time_ms, uint16_t power_mw);
 Servo_Feedback_t Servo_Read_Multi_Turn_Position(uint8_t id);
 void Servo_Sync_Set_Multi_Turn_Position_3CH(float angle0, float angle1, float angle2, uint32_t time_ms, uint16_t power_mw);
+void ESC_SetPower(float target_power_watts);  // <--- 加在函数声明区
 /* USER CODE END PFP */
 
 /* Private user code ---------------------------------------------------------*/
@@ -104,11 +109,18 @@ int main(void)
   /* Initialize all configured peripherals */
   MX_GPIO_Init();
   MX_USART6_UART_Init();
+  MX_TIM3_Init();
   /* USER CODE BEGIN 2 */
   HAL_GPIO_WritePin(GPIOE, GPIO_PIN_7, GPIO_PIN_SET); // 关闭发送通道
   HAL_GPIO_WritePin(GPIOE, GPIO_PIN_8, GPIO_PIN_SET); // 关闭接收通道
+  HAL_TIM_PWM_Start(&htim3, TIM_CHANNEL_4);
+  // 2. 初始给 0W 待机（等待电调上电解锁完成，延时 3~5 秒）
+  ESC_SetPower(0.0f);
+  HAL_Delay(3000);
+  //ESC_SetPower(30.0f);
+
   // 测试参数：截面倾角 24度，期望下偏 60度，侧偏 10度
-  double input_dN = 0.0;
+  double input_dN = 30.0;
   double input_dNy = 0.0;
   double param_theta = 26.25;
   //Servo_Set_Multi_Turn_Position(2, 0.0f, 3000, 0);
@@ -194,6 +206,65 @@ void SystemClock_Config(void)
   {
     Error_Handler();
   }
+}
+
+/**
+  * @brief TIM3 Initialization Function
+  * @param None
+  * @retval None
+  */
+static void MX_TIM3_Init(void)
+{
+
+  /* USER CODE BEGIN TIM3_Init 0 */
+
+  /* USER CODE END TIM3_Init 0 */
+
+  TIM_ClockConfigTypeDef sClockSourceConfig = {0};
+  TIM_MasterConfigTypeDef sMasterConfig = {0};
+  TIM_OC_InitTypeDef sConfigOC = {0};
+
+  /* USER CODE BEGIN TIM3_Init 1 */
+
+  /* USER CODE END TIM3_Init 1 */
+  htim3.Instance = TIM3;
+  htim3.Init.Prescaler = 83;
+  htim3.Init.CounterMode = TIM_COUNTERMODE_UP;
+  htim3.Init.Period = 19999;
+  htim3.Init.ClockDivision = TIM_CLOCKDIVISION_DIV1;
+  htim3.Init.AutoReloadPreload = TIM_AUTORELOAD_PRELOAD_ENABLE;
+  if (HAL_TIM_Base_Init(&htim3) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  sClockSourceConfig.ClockSource = TIM_CLOCKSOURCE_INTERNAL;
+  if (HAL_TIM_ConfigClockSource(&htim3, &sClockSourceConfig) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  if (HAL_TIM_PWM_Init(&htim3) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  sMasterConfig.MasterOutputTrigger = TIM_TRGO_RESET;
+  sMasterConfig.MasterSlaveMode = TIM_MASTERSLAVEMODE_DISABLE;
+  if (HAL_TIMEx_MasterConfigSynchronization(&htim3, &sMasterConfig) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  sConfigOC.OCMode = TIM_OCMODE_PWM1;
+  sConfigOC.Pulse = 0;
+  sConfigOC.OCPolarity = TIM_OCPOLARITY_HIGH;
+  sConfigOC.OCFastMode = TIM_OCFAST_DISABLE;
+  if (HAL_TIM_PWM_ConfigChannel(&htim3, &sConfigOC, TIM_CHANNEL_4) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  /* USER CODE BEGIN TIM3_Init 2 */
+
+  /* USER CODE END TIM3_Init 2 */
+  HAL_TIM_MspPostInit(&htim3);
+
 }
 
 /**
@@ -473,6 +544,27 @@ void Servo_Sync_Set_Multi_Turn_Position_3CH(float angle0, float angle1, float an
   // 恢复默认接收状态
   HAL_GPIO_WritePin(GPIOE, GPIO_PIN_7, GPIO_PIN_SET);
   HAL_GPIO_WritePin(GPIOE, GPIO_PIN_8, GPIO_PIN_RESET); // 👈 加上这一行：开接收
+}
+
+/**
+  * @brief  根据目标功率精确输出 PWM
+  * @param  target_power_watts: 期望的功率值（单位：W，范围 0 ~ 600W）
+  */
+void ESC_SetPower(float target_power_watts)
+{
+  // 1. 安全死限幅：强行限制最大允许输入功率为 600W
+  if (target_power_watts < 0.0f)   target_power_watts = 0.0f;
+  if (target_power_watts > 600.0f) target_power_watts = 600.0f; // 严格止步于 600W
+
+  // 2. 根据 P ∝ (Throttle)^3 反算油门百分比
+  // P_max 为满功率 6500W
+  float throttle_ratio = powf(target_power_watts / 6500.0f, 1.0f / 3.0f);
+
+  // 3. 将 0.0~1.0 的油门比例映射至 CCR 比较值 (1000 ~ 2000)
+  uint16_t ccr_value = (uint16_t)(1000.0f + throttle_ratio * 1000.0f);
+
+  // 4. 写入定时器
+  __HAL_TIM_SET_COMPARE(&htim3, TIM_CHANNEL_4, ccr_value);
 }
 /* USER CODE END 4 */
 
